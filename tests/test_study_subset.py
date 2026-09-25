@@ -111,6 +111,19 @@ def _registry():
     return registry
 
 
+def _output_dir(client, job_id: str) -> str:
+    return _registry().get(job_id).result.output_dir
+
+
+def _delete_output(client, job_id: str, original_sop_uid: str) -> str:
+    """按原始 SOP UID 删除对应匿名输出文件，返回被删的扁平输出文件名。"""
+    output_name = derive_uid(SECRET, original_sop_uid) + ".dcm"
+    path = os.path.join(_output_dir(client, job_id), output_name)
+    os.unlink(path)
+    assert not os.path.exists(path)
+    return output_name
+
+
 # --------------------------------------------------------------------------- #
 def test_subset_initial_study_without_outgoing_refs(client):
     files = {
@@ -340,3 +353,127 @@ def test_subset_with_canonical_sample_zip(client, tmp_path):
     full = client.get(f"/jobs/{job['id']}/download")
     assert full.status_code == 200
     assert len(_zip_names(full.content)) == job["output_file_count"] == 4
+
+
+def test_subset_missing_initial_file_409(client):
+    """回归：初选成员的物理文件丢失时，旧索引先过滤该文件导致缺片 ZIP。"""
+    files = {
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1"),
+        "a2.dcm": _ct_bytes("1.1.2", "2.1.1", "3.1"),
+    }
+    job = _upload(client, files)
+    missing_name = _delete_output(client, job["id"], "1.1.2")
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.1"))
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "REFERENCE_CLOSURE_INCOMPLETE"
+    problem = next(
+        p for p in detail["problems"]
+        if p["sop_instance_uid"] == derive_uid(SECRET, "1.1.2")
+    )
+    assert problem["reason"] == "output_missing"
+    assert problem["output_files"] == [missing_name]
+    assert problem["message"]
+    # 409 响应绝不能携带 ZIP 实体
+    assert r.headers["content-type"] != "application/zip"
+
+
+def test_subset_missing_recursive_added_file_409(client):
+    """递归补入的跨检查实例物理文件丢失，同样拒绝输出。"""
+    files = {
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1"),
+        "b1.dcm": _ct_bytes("1.2.1", "2.2.1", "3.2", top_refs=["1.1.1"]),
+    }
+    job = _upload(client, files)
+    missing_name = _delete_output(client, job["id"], "1.1.1")
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.2"))
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "REFERENCE_CLOSURE_INCOMPLETE"
+    problem = next(
+        p for p in detail["problems"]
+        if p["sop_instance_uid"] == derive_uid(SECRET, "1.1.1")
+    )
+    assert problem["reason"] == "output_missing"
+    assert problem["output_files"] == [missing_name]
+
+
+def test_subset_problems_aggregated_in_one_response(client):
+    """缺片、未收录引用与重复 SOP 必须在同一次 409 中汇总。"""
+    dup_sop = "1.7.7.777"
+    files = {
+        # a1 物理文件将在上传后删除（记录仍在）
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1"),
+        # b1 引用：缺失文件 a1、包外悬空 SOP、重复 SOP（dup_sop）
+        "b1.dcm": _ct_bytes(
+            "1.2.1", "2.2.1", "3.2",
+            top_refs=["1.1.1", "1.4.999", dup_sop],
+        ),
+        "dup_a.dcm": _ct_bytes(dup_sop, "2.7.7", "3.77"),
+        "dup_b.dcm": _ct_bytes(dup_sop, "2.7.7", "3.77"),
+    }
+    job = _upload(client, files)
+    missing_name = _delete_output(client, job["id"], "1.1.1")
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.2"))
+    assert r.status_code == 409, r.text
+    problems = {
+        p["sop_instance_uid"]: p for p in r.json()["detail"]["problems"]
+    }
+
+    p_missing = problems[derive_uid(SECRET, "1.1.1")]
+    assert p_missing["reason"] == "output_missing"
+    assert p_missing["output_files"] == [missing_name]
+
+    p_dangling = problems[derive_uid(SECRET, "1.4.999")]
+    assert p_dangling["reason"] == "not_in_output"
+    assert p_dangling["output_files"] == []
+
+    p_dup = problems[derive_uid(SECRET, dup_sop)]
+    assert p_dup["reason"] == "ambiguous_output"
+    new_sop = derive_uid(SECRET, dup_sop)
+    assert p_dup["output_files"] == sorted([f"{new_sop}.dcm", f"{new_sop}-2.dcm"])
+
+
+def test_subset_ambiguous_sop_with_missing_copy_reports_output_missing(client):
+    """重复 SOP 的多个输出中一个物理文件丢失：按 output_missing 定性，
+    output_files 列出缺失文件，而非含糊地报歧义。"""
+    dup_sop = "1.8.8.888"
+    files = {
+        "dup_a.dcm": _ct_bytes(dup_sop, "2.8.8", "3.88"),
+        "dup_b.dcm": _ct_bytes(dup_sop, "2.8.8", "3.88"),
+        "e1.dcm": _ct_bytes("1.9.9.1", "2.9.9", "3.99", top_refs=[dup_sop]),
+    }
+    job = _upload(client, files)
+    _delete_output(client, job["id"], dup_sop)  # 删除 <new_sop>.dcm，保留 -2
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.99"))
+    assert r.status_code == 409, r.text
+    problem = next(
+        p for p in r.json()["detail"]["problems"]
+        if p["sop_instance_uid"] == derive_uid(SECRET, dup_sop)
+    )
+    assert problem["reason"] == "output_missing"
+    assert problem["output_files"] == [derive_uid(SECRET, dup_sop) + ".dcm"]
+
+
+def test_subset_complete_closure_counts_and_zip_still_correct(client):
+    """完整文件下闭包下载、计数与扁平文件名保持原有正确行为。"""
+    files = {
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1"),
+        "b1.dcm": _ct_bytes("1.2.1", "2.2.1", "3.2",
+                            top_refs=["1.3.1"], deep_refs=["1.1.1"]),
+        "c1.dcm": _ct_bytes("1.3.1", "2.3.1", "3.3"),
+    }
+    job = _upload(client, files)
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.2"))
+    assert r.status_code == 200, r.text
+    assert r.headers["x-study-initial-file-count"] == "1"
+    assert r.headers["x-study-added-file-count"] == "2"
+    assert r.headers["x-study-subset-file-count"] == "3"
+    assert _zip_names(r.content) == {
+        derive_uid(SECRET, s) + ".dcm" for s in ("1.1.1", "1.2.1", "1.3.1")
+    }

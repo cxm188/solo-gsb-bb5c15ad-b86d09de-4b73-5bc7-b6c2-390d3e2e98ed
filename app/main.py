@@ -525,7 +525,8 @@ def download_job(job_id: str):
               "description": "任务不存在，或该匿名检查不在任务的成功输出中"},
         409: {"model": StudySubsetErrorDetail,
               "description": "任务未完成，或引用闭包无法在成功输出内闭合"
-                             "（引用缺失 / 一个 SOP UID 对应多个输出文件）"},
+                             "（引用缺失 / 一个 SOP UID 对应多个输出文件 / "
+                             "成功输出记录对应的物理文件已丢失）"},
     },
 )
 def download_study_subset(

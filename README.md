@@ -211,9 +211,10 @@ ZIP 中央目录允许出现**同名条目**（例如两个 `scan.dcm`，或 `./
    （`ReferencedSOPSequence`、RT 的 `ContourImageSequence`、
    `ReferencedFrameOfReferenceSequence` 等），把**同任务内**被引用的实例补入集合，
    引用目标可以属于**其他匿名检查**（跨检查引用同样补入），重复扫描直至闭包稳定；
-3. 只要存在引用目标**不在成功输出中**，或**一个匿名 SOP UID 对应多个输出文件**
-   （输入 ZIP 内重复实例），接口返回 `409`，在 `detail.problems[]` 中给出
-   **匿名 SOP UID 与原因**，**不输出残缺 ZIP**；
+3. 只要存在引用目标**不在成功输出中**、**一个匿名 SOP UID 对应多个输出文件**
+   （输入 ZIP 内重复实例），或**任务成功输出记录对应的物理文件已从 output_dir
+   丢失**，接口返回 `409`，在 `detail.problems[]` 中给出**匿名 SOP UID、原因与
+   缺失/冲突的 output_files**，**不输出残缺 ZIP**；
 4. 匿名检查在任务成功输出中不存在时返回 `404`（任务不存在同为 `404`）。
 
 成功时返回扁平 ZIP（文件名即匿名 `SOPInstanceUID`，与全量包内文件**逐字节相同**），
@@ -251,6 +252,7 @@ elif resp.status_code == 409:
     for p in detail["problems"]:
         # reason: not_in_output（引用目标不在成功输出中）
         #       | ambiguous_output（同一 SOP UID 对应多个输出文件）
+        #       | output_missing（成功输出记录的物理文件已丢失）
         print(p["sop_instance_uid"], p["reason"], p.get("output_files"))
 else:
     resp.raise_for_status()

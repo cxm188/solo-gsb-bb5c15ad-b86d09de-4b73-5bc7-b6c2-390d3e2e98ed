@@ -337,10 +337,13 @@ class StudySubsetProblemItem(BaseModel):
     sop_instance_uid: str = Field(description="出问题的匿名（已重写）SOPInstanceUID")
     reason: str = Field(
         description="not_in_output（引用目标不在本任务成功输出中） | "
-        "ambiguous_output（同一匿名 SOP UID 对应多个输出文件）"
+        "ambiguous_output（同一匿名 SOP UID 对应多个输出文件） | "
+        "output_missing（任务成功输出记录存在，但 output_dir 中物理文件已丢失）"
     )
     output_files: list[str] = Field(
-        default=[], description="ambiguous_output 时给出相互冲突的扁平输出文件名"
+        default=[],
+        description="ambiguous_output 时给出相互冲突的扁平输出文件名；"
+        "output_missing 时给出已丢失的扁平输出文件名",
     )
     message: str
 
