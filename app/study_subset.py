@@ -1,13 +1,18 @@
 """按匿名 StudyInstanceUID 下载检查子集（引用闭包自动补全）。
 
-数据来源严格限定为“已完成任务 output_dir 中的匿名 DICOM 文件”，
+数据来源严格限定为“已完成任务的成功匿名化输出记录”（result.files 中
+status != error 且记录了 output_name / 匿名 SOP UID 的条目），
 **不重新解压或处理原始 ZIP**：
 
-1. 以匿名 StudyInstanceUID 对应的全部成功输出实例作为初选集合；
+1. 以任务成功输出记录中匿名 StudyInstanceUID 对应的全部实例作为初选集合，
+   并以同一份记录建立匿名 SOPInstanceUID -> 输出文件的引用索引
+   （**不预先按磁盘存在性过滤**，避免丢片后初选悄悄少文件而产出残缺 ZIP）；
 2. 递归读取集合内匿名 DICOM 任意序列层级的 ReferencedSOPInstanceUID，
    把同任务内被引用的实例（可能属于其他检查）补入集合，循环至闭包稳定；
-3. 引用目标不在成功输出中、或一个匿名 SOP UID 对应多个输出文件时，
-   一律拒绝输出（交由路由层返回 409 与具体匿名 UID/原因），不产生残缺 ZIP。
+3. 初选实例与每一个递归补入实例在读取前都核对物理文件是否仍在 output_dir；
+   引用目标不在成功输出记录中、一个匿名 SOP UID 对应多个输出文件、
+   或记录存在但物理文件已丢失时，一律拒绝输出（交由路由层返回 409
+   与具体匿名 UID/原因），不产生残缺 ZIP。
 """
 from __future__ import annotations
 
@@ -27,6 +32,21 @@ REFERENCED_SOP_KEYWORD = "ReferencedSOPInstanceUID"
 # 409 问题原因
 REASON_NOT_IN_OUTPUT = "not_in_output"
 REASON_AMBIGUOUS_OUTPUT = "ambiguous_output"
+REASON_OUTPUT_MISSING = "output_missing"
+
+# 同一匿名 SOP UID 命中多种问题时的原因优先级：物理文件缺失最严重，
+# 一旦该 SOP 有任一记录文件丢失，歧义列表本身也无法完整核对
+_REASON_PRIORITY = {
+    REASON_OUTPUT_MISSING: 3,
+    REASON_AMBIGUOUS_OUTPUT: 2,
+    REASON_NOT_IN_OUTPUT: 1,
+}
+
+_PROBLEM_MESSAGES = {
+    REASON_NOT_IN_OUTPUT: "引用目标不在本任务的成功输出中",
+    REASON_AMBIGUOUS_OUTPUT: "一个匿名 SOPInstanceUID 对应多个输出文件，无法唯一补入",
+    REASON_OUTPUT_MISSING: "任务记录有该成功输出，但 output_dir 中的物理文件已不存在",
+}
 
 
 class StudySubsetError(Exception):
@@ -77,23 +97,27 @@ def _output_path(result: JobResult, report: FileReport) -> str:
 
 
 def _successful_outputs(result: JobResult) -> list[FileReport]:
-    """任务内真正写出且磁盘文件仍存在的匿名输出（error/无输出名者剔除）。"""
-    outputs: list[FileReport] = []
-    for report in result.files:
-        if (
-            report.status == "error"
-            or not report.output_name
-            or not report.sop_instance_uid
-        ):
-            continue
-        if not os.path.isfile(_output_path(result, report)):
-            continue
-        outputs.append(report)
-    return outputs
+    """任务的成功匿名化输出**记录**（error/无输出名/无 SOP UID 者剔除）。
+
+    注意：不在这里做磁盘存在性检查——初选与引用索引必须完整反映任务的
+    成功输出记录，物理文件缺失在闭包解析阶段统一核对并报 output_missing，
+    否则丢片会被静默过滤，进而产出缺片 ZIP。
+    """
+    return [
+        report
+        for report in result.files
+        if report.status != "error"
+        and report.output_name
+        and report.sop_instance_uid
+    ]
 
 
 def _build_sop_index(result: JobResult) -> dict[str, list[FileReport]]:
-    """匿名 SOPInstanceUID -> 成功输出文件报告（通常 1 个；重复 SOP 时多个）。"""
+    """匿名 SOPInstanceUID -> 成功输出记录（通常 1 个；重复 SOP 时多个）。
+
+    仅依据任务记录建索引，不预过滤磁盘文件：被引用目标的物理文件若已
+    丢失，应报 output_missing 而非误判为 not_in_output。
+    """
     index: dict[str, list[FileReport]] = {}
     for report in _successful_outputs(result):
         index.setdefault(report.sop_instance_uid, []).append(report)
@@ -133,14 +157,32 @@ def iter_referenced_sop_uids(ds) -> list[str]:
 # --------------------------------------------------------------------------- #
 # 引用闭包
 # --------------------------------------------------------------------------- #
+def _record_problem(
+    problems: dict[str, tuple[str, list[str]]],
+    uid: str,
+    reason: str,
+    output_files: Optional[list[str]] = None,
+) -> None:
+    """登记某个匿名 SOP UID 的问题；同 UID 多问题按优先级保留最严重者。
+
+    output_files 随原因累加去重（如同一 UID 多份记录文件先后发现丢失）。
+    """
+    files = sorted(output_files or [])
+    existing = problems.get(uid)
+    if existing is None or _REASON_PRIORITY[reason] > _REASON_PRIORITY[existing[0]]:
+        problems[uid] = (reason, files)
+    elif reason == existing[0]:
+        merged = sorted(set(existing[1]) | set(files))
+        problems[uid] = (reason, merged)
+
+
 def resolve_study_closure(result: JobResult, study_uid: str) -> StudyClosure:
-    """返回某匿名检查在本任务成功输出上的引用闭包；无法闭合时抛 StudySubsetError。"""
+    """返回某匿名检查在本任务成功输出记录上的引用闭包；无法闭合时抛 StudySubsetError。"""
+    outputs = _successful_outputs(result)
     index = _build_sop_index(result)
 
     initial = [
-        report
-        for report in _successful_outputs(result)
-        if report.study_instance_uid == study_uid
+        report for report in outputs if report.study_instance_uid == study_uid
     ]
     if not initial:
         raise StudySubsetError(
@@ -153,12 +195,24 @@ def resolve_study_closure(result: JobResult, study_uid: str) -> StudyClosure:
     chosen: dict[str, FileReport] = {r.output_name: r for r in initial}
     queue: list[FileReport] = list(initial)
     queued = {r.output_name for r in initial}
-    # uid -> (reason, output_files)；同一 UID 只报一次，按“缺失优先”保留首次判定
+    # uid -> (reason, output_files)；同一 UID 只报一次，按优先级保留最严重判定
     problems: dict[str, tuple[str, list[str]]] = {}
 
     while queue:
         report = queue.pop()
         path = _output_path(result, report)
+
+        # 初选与递归补入的实例逐个核对物理文件：记录有、文件无即 output_missing，
+        # 不读取、不扫描其引用（文件内容已不可信），但继续遍历以汇总全部问题
+        if not os.path.isfile(path):
+            _record_problem(
+                problems,
+                report.sop_instance_uid,
+                REASON_OUTPUT_MISSING,
+                [report.output_name],
+            )
+            continue
+
         try:
             ds = pydicom.dcmread(path)
         except Exception as exc:  # 自己写出的匿名文件不可读属于服务端异常
@@ -173,29 +227,29 @@ def resolve_study_closure(result: JobResult, study_uid: str) -> StudyClosure:
         # 不挑选、不猜测，直接 409（全量下载行为不受影响）
         own_targets = index.get(report.sop_instance_uid, [])
         if len(own_targets) > 1:
-            problems.setdefault(
+            _record_problem(
+                problems,
                 report.sop_instance_uid,
-                (
-                    REASON_AMBIGUOUS_OUTPUT,
-                    sorted(t.output_name for t in own_targets),
-                ),
+                REASON_AMBIGUOUS_OUTPUT,
+                [t.output_name for t in own_targets],
             )
 
         for ref_uid in iter_referenced_sop_uids(ds):
             targets = index.get(ref_uid, [])
             if not targets:
-                problems.setdefault(ref_uid, (REASON_NOT_IN_OUTPUT, []))
+                _record_problem(problems, ref_uid, REASON_NOT_IN_OUTPUT)
                 continue
             if len(targets) > 1:
-                problems.setdefault(
+                _record_problem(
+                    problems,
                     ref_uid,
-                    (
-                        REASON_AMBIGUOUS_OUTPUT,
-                        sorted(t.output_name for t in targets),
-                    ),
+                    REASON_AMBIGUOUS_OUTPUT,
+                    [t.output_name for t in targets],
                 )
             # 即使存在歧义也继续向下扫描，尽量一次性暴露全部闭包问题；
             # 有 problems 时最终必定 409，chosen 仅用于遍历，不会被输出。
+            # 引用目标若仅物理文件丢失（记录仍在索引中），在轮到它出队时
+            # 统一核对为 output_missing，而不是被误判为 not_in_output。
             for target in targets:
                 chosen.setdefault(target.output_name, target)
                 if target.output_name not in queued:
@@ -208,11 +262,7 @@ def resolve_study_closure(result: JobResult, study_uid: str) -> StudyClosure:
                 "sop_instance_uid": uid,
                 "reason": reason,
                 "output_files": output_files,
-                "message": (
-                    "引用目标不在本任务的成功输出中"
-                    if reason == REASON_NOT_IN_OUTPUT
-                    else "一个匿名 SOPInstanceUID 对应多个输出文件，无法唯一补入"
-                ),
+                "message": _PROBLEM_MESSAGES[reason],
             }
             for uid, (reason, output_files) in sorted(problems.items())
         ]
@@ -224,6 +274,7 @@ def resolve_study_closure(result: JobResult, study_uid: str) -> StudyClosure:
             problems=problem_items,
         )
 
+    # 无 problems 时闭包内每个实例均已通过物理文件核对，ZIP 不会残缺
     return StudyClosure(
         initial_reports=initial,
         included_reports=[chosen[name] for name in sorted(chosen)],

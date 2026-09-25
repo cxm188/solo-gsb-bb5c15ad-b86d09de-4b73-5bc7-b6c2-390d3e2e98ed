@@ -206,14 +206,17 @@ ZIP 中央目录允许出现**同名条目**（例如两个 `scan.dcm`，或 `./
 
 闭包补全规则：
 
-1. 以该匿名检查的**全部成功输出实例**作为初选集合；
+1. 以任务**成功输出记录**中该匿名检查的全部实例作为初选集合，并以同一份
+   记录建立匿名 SOP UID 引用索引（**不按磁盘存在性预过滤**）；
 2. 递归读取集合内匿名 DICOM **任意序列层级**的 `ReferencedSOPInstanceUID`
    （`ReferencedSOPSequence`、RT 的 `ContourImageSequence`、
    `ReferencedFrameOfReferenceSequence` 等），把**同任务内**被引用的实例补入集合，
    引用目标可以属于**其他匿名检查**（跨检查引用同样补入），重复扫描直至闭包稳定；
-3. 只要存在引用目标**不在成功输出中**，或**一个匿名 SOP UID 对应多个输出文件**
-   （输入 ZIP 内重复实例），接口返回 `409`，在 `detail.problems[]` 中给出
-   **匿名 SOP UID 与原因**，**不输出残缺 ZIP**；
+3. 初选实例与每一个递归补入实例在读取前都核对 output_dir 中的物理文件是否仍在；
+   只要存在物理文件丢失、引用目标**不在成功输出记录中**，或
+   **一个匿名 SOP UID 对应多个输出文件**（输入 ZIP 内重复实例），接口返回 `409`，
+   在 `detail.problems[]` 中**一次性汇总**给出**匿名 SOP UID 与原因**，
+   **不输出残缺 ZIP**；
 4. 匿名检查在任务成功输出中不存在时返回 `404`（任务不存在同为 `404`）。
 
 成功时返回扁平 ZIP（文件名即匿名 `SOPInstanceUID`，与全量包内文件**逐字节相同**），
@@ -249,8 +252,9 @@ elif resp.status_code == 409:
     detail = resp.json()["detail"]
     print("引用闭包无法闭合：", detail["code"])
     for p in detail["problems"]:
-        # reason: not_in_output（引用目标不在成功输出中）
+        # reason: not_in_output（引用目标不在成功输出记录中）
         #       | ambiguous_output（同一 SOP UID 对应多个输出文件）
+        #       | output_missing（记录有该成功输出，但物理文件已丢失）
         print(p["sop_instance_uid"], p["reason"], p.get("output_files"))
 else:
     resp.raise_for_status()
@@ -1069,7 +1073,7 @@ else:
 | `404` | `JOB_NOT_FOUND` | 任务 ID 不存在或已过期 |
 | `404` | `STUDY_NOT_FOUND` | 该匿名 StudyInstanceUID 不在任务的成功输出中 |
 | `409` | `JOB_NOT_READY` | 任务 `status != ready`（匿名化处理失败） |
-| `409` | `REFERENCE_CLOSURE_INCOMPLETE` | 引用闭包无法在成功输出内闭合；`detail.problems[]` 逐项给出匿名 `sop_instance_uid`、`reason`（`not_in_output` / `ambiguous_output`）与 `output_files`（歧义时的冲突文件名） |
+| `409` | `REFERENCE_CLOSURE_INCOMPLETE` | 引用闭包无法在成功输出内闭合；`detail.problems[]` 逐项给出匿名 `sop_instance_uid`、`reason`（`not_in_output` / `ambiguous_output` / `output_missing`）与 `output_files`（歧义时的冲突文件名，或缺片时已丢失的文件名）；初选与递归补入实例的物理文件缺失也在此一次性汇总 |
 
 `409` 响应示例：
 
@@ -1081,8 +1085,8 @@ else:
     "study_instance_uid": "2.25.8912…",
     "problems": [
       {"sop_instance_uid": "2.25.1613…",
-       "reason": "not_in_output",          // 或 ambiguous_output
-       "output_files": [],                  // ambiguous_output 时为冲突文件名列表
+       "reason": "not_in_output",          // 或 ambiguous_output / output_missing
+       "output_files": [],                  // ambiguous_output 为冲突文件名；output_missing 为已丢失文件名
        "message": "引用目标不在本任务的成功输出中"}
     ]
   }

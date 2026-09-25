@@ -340,3 +340,126 @@ def test_subset_with_canonical_sample_zip(client, tmp_path):
     full = client.get(f"/jobs/{job['id']}/download")
     assert full.status_code == 200
     assert len(_zip_names(full.content)) == job["output_file_count"] == 4
+
+
+# --------------------------------------------------------------------------- #
+# 任务记录有成功输出、但 output_dir 物理文件丢失：禁止缺片 ZIP
+# --------------------------------------------------------------------------- #
+def _anonymized_output_path(client, job_id: str, old_sop_uid: str) -> str:
+    job_obj = _registry().get(job_id)
+    return os.path.join(
+        job_obj.result.output_dir, derive_uid(SECRET, old_sop_uid) + ".dcm"
+    )
+
+
+def test_subset_initial_output_file_missing_409(client):
+    files = {
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1"),
+        "a2.dcm": _ct_bytes("1.1.2", "2.1.1", "3.1"),
+    }
+    job = _upload(client, files)
+
+    # 任务记录中两个文件都成功，但 output_dir 里的 a2 物理丢失
+    lost = _anonymized_output_path(client, job["id"], "1.1.2")
+    os.unlink(lost)
+    assert not os.path.exists(lost)
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.1"))
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "REFERENCE_CLOSURE_INCOMPLETE"
+    problem = next(
+        p for p in detail["problems"]
+        if p["sop_instance_uid"] == derive_uid(SECRET, "1.1.2")
+    )
+    assert problem["reason"] == "output_missing"
+    assert problem["output_files"] == [derive_uid(SECRET, "1.1.2") + ".dcm"]
+    assert problem["message"]
+    # 不得返回任何 ZIP / 计数头，响应体即 409 错误详情
+    assert "x-study-subset-file-count" not in r.headers
+    assert r.headers["content-type"].startswith("application/json")
+
+
+def test_subset_recursively_added_output_file_missing_409(client):
+    files = {
+        # 检查 A：被 B 跨检查引用，但物理文件丢失
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1"),
+        # 检查 B：b1 引用 a1，递归补入时才能发现 a1 缺片
+        "b1.dcm": _ct_bytes("1.2.1", "2.2.1", "3.2", top_refs=["1.1.1"]),
+    }
+    job = _upload(client, files)
+    os.unlink(_anonymized_output_path(client, job["id"], "1.1.1"))
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.2"))
+    assert r.status_code == 409, r.text
+    problems = r.json()["detail"]["problems"]
+    assert len(problems) == 1
+    problem = problems[0]
+    # 关键：记录仍在引用索引中，必须报 output_missing 而非 not_in_output
+    assert problem["sop_instance_uid"] == derive_uid(SECRET, "1.1.1")
+    assert problem["reason"] == "output_missing"
+    assert problem["output_files"] == [derive_uid(SECRET, "1.1.1") + ".dcm"]
+
+
+def test_subset_missing_file_and_dangling_ref_aggregated_together(client):
+    files = {
+        # a1 带悬空引用（not_in_output）
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1", top_refs=["1.1.999"]),
+        # a2 物理文件丢失（output_missing）
+        "a2.dcm": _ct_bytes("1.1.2", "2.1.1", "3.1"),
+    }
+    job = _upload(client, files)
+    os.unlink(_anonymized_output_path(client, job["id"], "1.1.2"))
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.1"))
+    assert r.status_code == 409, r.text
+    problems = r.json()["detail"]["problems"]
+    by_uid = {p["sop_instance_uid"]: p for p in problems}
+    assert by_uid[derive_uid(SECRET, "1.1.999")]["reason"] == "not_in_output"
+    missing = by_uid[derive_uid(SECRET, "1.1.2")]
+    assert missing["reason"] == "output_missing"
+    assert missing["output_files"] == [derive_uid(SECRET, "1.1.2") + ".dcm"]
+    # 两类问题在同一次响应中汇总，按匿名 UID 排序
+    assert [p["sop_instance_uid"] for p in problems] == sorted(by_uid)
+
+
+def test_subset_ambiguous_sop_with_one_missing_copy_reports_output_missing(client):
+    dup_sop = "1.5.5.777"
+    files = {
+        "dup_a.dcm": _ct_bytes(dup_sop, "2.5.5", "3.55"),
+        "dup_b.dcm": _ct_bytes(dup_sop, "2.5.5", "3.55"),
+    }
+    job = _upload(client, files)
+    # 重复 SOP 的其中一份物理文件丢失：缺片优先于歧义
+    os.unlink(
+        os.path.join(
+            _registry().get(job["id"]).result.output_dir,
+            derive_uid(SECRET, dup_sop) + "-2.dcm",
+        )
+    )
+
+    r = _download(client, job["id"], derive_uid(SECRET, "3.55"))
+    assert r.status_code == 409, r.text
+    problems = r.json()["detail"]["problems"]
+    by_uid = {p["sop_instance_uid"]: p for p in problems}
+    problem = by_uid[derive_uid(SECRET, dup_sop)]
+    assert problem["reason"] == "output_missing"
+    assert problem["output_files"] == [derive_uid(SECRET, dup_sop) + "-2.dcm"]
+
+
+def test_subset_complete_files_closure_counts_unchanged(client):
+    """无缺片时闭包下载与计数保持原有正确行为。"""
+    files = {
+        "a1.dcm": _ct_bytes("1.1.1", "2.1.1", "3.1"),
+        "b1.dcm": _ct_bytes("1.2.1", "2.2.1", "3.2", top_refs=["1.1.1"]),
+        "b2.dcm": _ct_bytes("1.2.2", "2.2.1", "3.2"),
+    }
+    job = _upload(client, files)
+    r = _download(client, job["id"], derive_uid(SECRET, "3.2"))
+    assert r.status_code == 200, r.text
+    assert r.headers["x-study-initial-file-count"] == "2"
+    assert r.headers["x-study-added-file-count"] == "1"
+    assert r.headers["x-study-subset-file-count"] == "3"
+    assert _zip_names(r.content) == {
+        derive_uid(SECRET, s) + ".dcm" for s in ("1.1.1", "1.2.1", "1.2.2")
+    }
